@@ -142,6 +142,9 @@ type SplitFunction func(*packet.Packet, UserContext) uint
 // VectorSplitFunction is a function type like SplitFunction for vector splitting
 type VectorSplitFunction func([]*packet.Packet, *[vBurstSize]bool, *[vBurstSize]uint8, UserContext)
 
+type EnqFunction func(uintptr, *bool)
+type DeqFunction func(*uintptr, *bool)
+
 // Kni is a high level struct of KNI device. The device itself is stored
 // in C memory in low.c and is defined by its port which is equal to port
 // in this structure
@@ -385,6 +388,30 @@ func addReader(filename string, out low.Rings, repcount int32) {
 	par.filename = filename
 	par.repcount = repcount
 	schedState.addFF("read", read, nil, nil, par, nil, readWrite, 0, &par.stats)
+}
+
+type enqParameters struct {
+	in   low.Rings
+	enqf EnqFunction
+}
+
+func addEnqer(in low.Rings, enqf EnqFunction, inIndexNumber int32) {
+	par := new(enqParameters)
+	par.in = in
+	par.enqf = enqf
+	schedState.addFF("enq", enq, nil, nil, par, nil, readWrite, inIndexNumber, nil)
+}
+
+type deqParameters struct {
+	out  low.Rings
+	deqf DeqFunction
+}
+
+func addDeqer(out low.Rings, deqf DeqFunction) {
+	par := new(deqParameters)
+	par.out = out
+	par.deqf = deqf
+	schedState.addFF("deq", deq, nil, nil, par, nil, readWrite, 0, nil)
 }
 
 func makeSlice(out low.Rings, segment *processSegment) *Func {
@@ -1083,6 +1110,20 @@ func SetSenderKNI(IN *Flow, kni *Kni) error {
 	return nil
 }
 
+func SetEnqer(IN *Flow, enqf EnqFunction) error {
+	if err := checkFlow(IN); err != nil {
+		return err
+	}
+	addEnqer(finishFlow(IN), enqf, IN.inIndexNumber)
+	return nil
+}
+
+func SetDeqer(deqf DeqFunction) (OUT *Flow, err error) {
+	rings := low.CreateRings(burstSize*sizeMultiplier, 1)
+	addDeqer(rings, deqf)
+	return newFlow(rings, 1), nil
+}
+
 // SetCopier adds copy function to flow graph.
 // Gets flow which will be copied.
 func SetCopier(IN *Flow) (OUT *Flow, err error) {
@@ -1771,6 +1812,11 @@ func merge(from low.Rings, to low.Rings) {
 			if parameters.out[0] == from[0] {
 				parameters.out = to
 			}
+		case *deqParameters:
+			if parameters.out[0] == from[0] {
+				parameters.out = to
+				common.LogDebug(common.Initialization, "merge: deqParameters")
+			}
 		case *copyParameters:
 			if parameters.out[0] == from[0] {
 				parameters.out = to
@@ -1954,6 +2000,63 @@ func read(parameters interface{}, inIndex []int32, stopper [2]chan int) {
 
 			if countersEnabledInApplication {
 				updatePortStatsOne(&rp.stats, tempPacket)
+			}
+		}
+	}
+}
+
+func enq(parameters interface{}, inIndex []int32, stopper [2]chan int) {
+	ep := parameters.(*enqParameters)
+	IN := ep.in
+	enqf := ep.enqf
+
+	bufIn := make([]uintptr, 1)
+	var enqed bool
+
+	for {
+		select {
+		case <-stopper[0]:
+			// It is time to close this clone
+			stopper[1] <- 1
+			return
+		default:
+			for q := int32(0); q < inIndex[0]; q++ {
+				n := IN[q].DequeueBurst(bufIn, 1)
+				if n == 0 {
+					continue
+				}
+				enqf(bufIn[0], &enqed)
+				if !enqed {
+					low.DirectStop(1, bufIn)
+				}
+			}
+		}
+	}
+}
+
+func deq(parameters interface{}, inIndex []int32, stopper [2]chan int) {
+	ep := parameters.(*deqParameters)
+	OUT := ep.out
+	deqf := ep.deqf
+
+	bufOut := make([]uintptr, 1)
+	var deqed bool
+
+	for {
+		select {
+		case <-stopper[0]:
+			// It is time to close this clone
+			stopper[1] <- 1
+			return
+		default:
+			bufOut[0] = 0
+			deqf(&bufOut[0], &deqed)
+			if bufOut[0] != 0 {
+				if !deqed {
+					low.DirectStop(1, bufOut)
+				} else {
+					safeEnqueue(OUT[0], bufOut, 1)
+				}
 			}
 		}
 	}
