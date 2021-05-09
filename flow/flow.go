@@ -69,6 +69,7 @@ type processSegment struct {
 type Flow struct {
 	current       low.Rings
 	segment       *processSegment
+	enqdeq        low.Rings
 	previous      **Func
 	inIndexNumber int32
 }
@@ -141,6 +142,9 @@ type SplitFunction func(*packet.Packet, UserContext) uint
 
 // VectorSplitFunction is a function type like SplitFunction for vector splitting
 type VectorSplitFunction func([]*packet.Packet, *[vBurstSize]bool, *[vBurstSize]uint8, UserContext)
+
+type EnqFunction func(uintptr, *bool)
+type DeqFunction func(*uintptr, *bool)
 
 // Kni is a high level struct of KNI device. The device itself is stored
 // in C memory in low.c and is defined by its port which is equal to port
@@ -385,6 +389,22 @@ func addReader(filename string, out low.Rings, repcount int32) {
 	par.filename = filename
 	par.repcount = repcount
 	schedState.addFF("read", read, nil, nil, par, nil, readWrite, 0, &par.stats)
+}
+
+type enqdeqParameters struct {
+	in   low.Rings
+	out  low.Rings
+	enqf EnqFunction
+	deqf DeqFunction
+}
+
+func addEnqerDeqer(in low.Rings, out low.Rings, enqf EnqFunction, deqf DeqFunction, inIndexNumber int32) {
+	par := new(enqdeqParameters)
+	par.in = in
+	par.out = out
+	par.enqf = enqf
+	par.deqf = deqf
+	schedState.addFF("enqdeq", enqdeq, nil, nil, par, nil, readWrite, inIndexNumber, nil)
 }
 
 func makeSlice(out low.Rings, segment *processSegment) *Func {
@@ -1083,6 +1103,15 @@ func SetSenderKNI(IN *Flow, kni *Kni) error {
 	return nil
 }
 
+func SetEnqerDeqer(IN *Flow, enqf EnqFunction, deqf DeqFunction) error {
+	if err := checkFlow(IN); err != nil {
+		return err
+	}
+	IN.enqdeq = low.CreateRings(burstSize*sizeMultiplier, 1)
+	addEnqerDeqer(IN.current, IN.enqdeq, enqf, deqf, IN.inIndexNumber)
+	return nil
+}
+
 // SetCopier adds copy function to flow graph.
 // Gets flow which will be copied.
 func SetCopier(IN *Flow) (OUT *Flow, err error) {
@@ -1273,7 +1302,10 @@ func SetMerger(InArray ...*Flow) (OUT *Flow, err error) {
 }
 
 func mergeOneFlow(IN *Flow, rings low.Rings) {
-	if IN.segment == nil {
+	if IN.enqdeq != nil {
+		merge(IN.enqdeq, rings)
+		closeFlow(IN)
+	} else if IN.segment == nil {
 		merge(IN.current, rings)
 		closeFlow(IN)
 	} else {
@@ -1771,6 +1803,11 @@ func merge(from low.Rings, to low.Rings) {
 			if parameters.out[0] == from[0] {
 				parameters.out = to
 			}
+		case *enqdeqParameters:
+			if parameters.out[0] == from[0] {
+				parameters.out = to
+				common.LogDebug(common.Initialization, "merge: enqdeqParameters")
+			}
 		case *copyParameters:
 			if parameters.out[0] == from[0] {
 				parameters.out = to
@@ -1954,6 +1991,52 @@ func read(parameters interface{}, inIndex []int32, stopper [2]chan int) {
 
 			if countersEnabledInApplication {
 				updatePortStatsOne(&rp.stats, tempPacket)
+			}
+		}
+	}
+}
+
+func enqdeq(parameters interface{}, inIndex []int32, stopper [2]chan int) {
+	ep := parameters.(*enqdeqParameters)
+	IN := ep.in
+	OUT := ep.out
+	enqf := ep.enqf
+	deqf := ep.deqf
+
+	bufIn := make([]uintptr, 1)
+	bufOut := make([]uintptr, 1)
+	var enqed bool
+	var deqed bool
+
+	for {
+		select {
+		case <-stopper[0]:
+			// It is time to close this clone
+			stopper[1] <- 1
+			return
+		default:
+			for {
+				bufOut[0] = 0
+				deqf(&bufOut[0], &deqed)
+				if bufOut[0] != 0 {
+					if !deqed {
+						low.DirectStop(1, bufOut)
+					} else {
+						safeEnqueue(OUT[0], bufOut, 1)
+					}
+				} else {
+					break
+				}
+			}
+			for q := int32(0); q < inIndex[0]; q++ {
+				n := IN[q].DequeueBurst(bufIn, 1)
+				if n == 0 {
+					continue
+				}
+				enqf(bufIn[0], &enqed)
+				if !enqed {
+					low.DirectStop(1, bufIn)
+				}
 			}
 		}
 	}
